@@ -1,0 +1,632 @@
+"""
+2-Link Planar Robot — Forward Dynamics NN + PID Controller (STABLE VERSION)
+===========================================================================
+
+Corrected dynamics with proper stability measures.
+"""
+
+import os
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+# ── Reproducibility ───────────────────────────────────────────────────────────
+SEED = 42
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+# ── Robot physical parameters (2-link planar manipulator) ─────────────────────
+L1 = 1.0          # length of link 1 (m)
+L2 = 0.8          # length of link 2 (m)
+M1 = 2.0          # mass of link 1 (kg)
+M2 = 1.5          # mass of link 2 (kg)
+
+# Center of mass locations (assuming uniform distribution, from joint)
+r1 = L1 / 2.0     # CoM of link 1 from joint 1 (m)
+r2 = L2 / 2.0     # CoM of link 2 from joint 2 (m)
+
+# Moments of inertia about CoM
+I1_cm = (1.0/12.0) * M1 * L1**2  # kg·m²
+I2_cm = (1.0/12.0) * M2 * L2**2  # kg·m²
+
+# Moments of inertia about joints (using parallel axis theorem)
+I1 = I1_cm + M1 * r1**2
+I2 = I2_cm + M2 * r2**2
+
+G = 9.81          # gravity (m/s²)
+
+# Motor/actuator parameters
+TAU_MAX = 30.0    # maximum joint torque (Nm) - REDUCED for stability
+DAMPING_1 = 1.5   # joint 1 viscous damping (Nm·s/rad)
+DAMPING_2 = 1.0   # joint 2 viscous damping (Nm·s/rad)
+DT = 0.01         # simulation time-step (s)
+
+# Joint limits (radians)
+Q1_MIN, Q1_MAX = -2.5, 2.5
+Q2_MIN, Q2_MAX = -2.0, 2.0
+DQ_MAX = 3.0     # maximum joint velocity (rad/s)
+DDQ_MAX = 15.0   # maximum joint acceleration (rad/s²)
+
+INPUT_NAMES  = ["tau1", "tau2", "q1", "q2", "dq1", "dq2"]
+OUTPUT_NAMES = ["tau1_nn", "tau2_nn", "ddq1", "ddq2"]
+N_IN, N_OUT  = len(INPUT_NAMES), len(OUTPUT_NAMES)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1.  ROBOT SIMULATOR (with corrected dynamics)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TwoLinkRobotSimulator:
+    """
+    Corrected dynamics for a 2-link planar robot with stability measures.
+    """
+    
+    def __init__(self, dt: float = DT):
+        self.dt = dt
+        self.reset()
+        
+    def reset(self):
+        self.q1 = 0.0
+        self.q2 = 0.0
+        self.dq1 = 0.0
+        self.dq2 = 0.0
+        
+    def get_end_effector_position(self):
+        """Calculate end-effector position in Cartesian coordinates"""
+        x = L1 * np.cos(self.q1) + L2 * np.cos(self.q1 + self.q2)
+        y = L1 * np.sin(self.q1) + L2 * np.sin(self.q1 + self.q2)
+        return x, y
+    
+    def compute_inertia_matrix(self, q2):
+        """Compute corrected mass matrix M(q)"""
+        # Using standard manipulator inertia matrix formulation
+        m11 = I1 + I2 + M2 * L1**2 + 2 * M2 * L1 * r2 * np.cos(q2)
+        m12 = I2 + M2 * L1 * r2 * np.cos(q2)
+        m21 = m12
+        m22 = I2
+        return np.array([[m11, m12], [m21, m22]])
+    
+    def compute_coriolis_matrix(self, q2, dq1, dq2):
+        """Compute corrected Coriolis and centrifugal matrix C(q,dq)"""
+        h = -M2 * L1 * r2 * np.sin(q2)
+        c11 = h * dq2
+        c12 = h * (dq1 + dq2)
+        c21 = -h * dq1
+        c22 = 0
+        return np.array([[c11, c12], [c21, c22]])
+    
+    def compute_gravity_vector(self, q1, q2):
+        """Compute corrected gravity vector G(q)"""
+        g1 = (M1 * r1 + M2 * L1) * G * np.cos(q1) + M2 * r2 * G * np.cos(q1 + q2)
+        g2 = M2 * r2 * G * np.cos(q1 + q2)
+        return np.array([g1, g2])
+    
+    def compute_dynamics(self, tau1, tau2):
+        """Compute joint accelerations using corrected manipulator equations"""
+        tau = np.array([tau1, tau2])
+        
+        # Mass matrix
+        M = self.compute_inertia_matrix(self.q2)
+        
+        # Coriolis matrix
+        C = self.compute_coriolis_matrix(self.q2, self.dq1, self.dq2)
+        
+        # Gravity vector
+        G_vec = self.compute_gravity_vector(self.q1, self.q2)
+        
+        # Damping forces
+        damping = np.array([DAMPING_1 * self.dq1, DAMPING_2 * self.dq2])
+        
+        # Solve for accelerations: M·ddq = τ - C·dq - G - damping
+        try:
+            ddq = np.linalg.solve(M, tau - C @ np.array([self.dq1, self.dq2]) - G_vec - damping)
+            # Clip accelerations for stability
+            ddq = np.clip(ddq, -DDQ_MAX, DDQ_MAX)
+        except np.linalg.LinAlgError:
+            # Singular matrix fallback
+            ddq = np.array([0.0, 0.0])
+        
+        return ddq[0], ddq[1]
+    
+    def step(self, tau: np.ndarray):
+        """
+        Advance one timestep with stability measures.
+        
+        Returns
+        -------
+        obs     : np.ndarray (6,)  [q1, q2, dq1, dq2, tau1, tau2]
+        dyn     : tuple  (tau1_act, tau2_act, ddq1, ddq2)
+        """
+        tau = np.clip(tau, -TAU_MAX, TAU_MAX)
+        tau1, tau2 = tau[0], tau[1]
+        dt = self.dt
+        
+        # Use smaller timestep for integration if needed (simple Euler)
+        # For better stability, use semi-implicit Euler
+        ddq1, ddq2 = self.compute_dynamics(tau1, tau2)
+        
+        # Semi-implicit Euler (update velocities first)
+        self.dq1 = self.dq1 + ddq1 * dt
+        self.dq2 = self.dq2 + ddq2 * dt
+        
+        # Clip velocities
+        self.dq1 = np.clip(self.dq1, -DQ_MAX, DQ_MAX)
+        self.dq2 = np.clip(self.dq2, -DQ_MAX, DQ_MAX)
+        
+        # Update positions
+        self.q1 += self.dq1 * dt
+        self.q2 += self.dq2 * dt
+        
+        # Apply joint limits with velocity reflection
+        if self.q1 < Q1_MIN:
+            self.q1 = Q1_MIN
+            self.dq1 = -self.dq1 * 0.5  # Damp reflection
+        if self.q1 > Q1_MAX:
+            self.q1 = Q1_MAX
+            self.dq1 = -self.dq1 * 0.5
+            
+        if self.q2 < Q2_MIN:
+            self.q2 = Q2_MIN
+            self.dq2 = -self.dq2 * 0.5
+        if self.q2 > Q2_MAX:
+            self.q2 = Q2_MAX
+            self.dq2 = -self.dq2 * 0.5
+        
+        obs = np.array([self.q1, self.q2, self.dq1, self.dq2, tau1, tau2], dtype=np.float32)
+        return obs, (tau1, tau2, ddq1, ddq2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2.  TRAINING DATA GENERATION (with smoother exploration)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def generate_training_data(n_samples: int = 20_000, noise_std: float = 0.01):
+    """
+    Collect data using smooth random exploration for better coverage.
+    """
+    robot = TwoLinkRobotSimulator()
+    X, Y = [], []
+    tau = np.zeros(2)
+    WARMUP = 200
+    
+    # Use smoother exploration
+    for i in range(n_samples + WARMUP):
+        # Periodic reset to explore different regions
+        if i % 500 == 0:
+            robot.reset()
+            tau = np.random.uniform(-TAU_MAX * 0.5, TAU_MAX * 0.5, 2)
+        else:
+            # Smooth random walk with smaller steps
+            tau += np.random.randn(2) * 3.0
+            tau = np.clip(tau, -TAU_MAX * 0.8, TAU_MAX * 0.8)
+        
+        obs, (tau1_act, tau2_act, ddq1, ddq2) = robot.step(tau)
+        q1, q2, dq1, dq2, tau1_cmd, tau2_cmd = obs
+        
+        # Only collect data in stable regions
+        if i >= WARMUP and abs(ddq1) < DDQ_MAX * 0.8 and abs(ddq2) < DDQ_MAX * 0.8:
+            row_x = [tau1_cmd, tau2_cmd, q1, q2, dq1, dq2]
+            row_y = [tau1_act, tau2_act, ddq1, ddq2]
+            if np.all(np.isfinite(row_x)) and np.all(np.isfinite(row_y)):
+                X.append(row_x)
+                Y.append(row_y)
+            else:
+                robot.reset()
+                tau = np.zeros(2)
+    
+    X = np.array(X, dtype=np.float32)
+    Y = np.array(Y, dtype=np.float32)
+    
+    print(f"Generated {len(X)} stable samples")
+    
+    # Add small noise for robustness
+    if noise_std > 0:
+        X[:, 2:6] += np.random.normal(0, noise_std, (len(X), 4))
+        Y += np.random.normal(0, noise_std * 0.1, Y.shape)
+    
+    return X, Y
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3.  FORWARD DYNAMICS NN (with regularization for stability)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_forward_dynamics_nn(lr: float = 5e-4) -> keras.Model:
+    inp = keras.Input(shape=(N_IN,), name="robot_inputs")
+    
+    # Hidden layers with careful regularization
+    x = layers.Dense(128, kernel_regularizer=keras.regularizers.l2(1e-5))(inp)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    x = layers.Dropout(0.1)(x)
+    
+    x = layers.Dense(64, kernel_regularizer=keras.regularizers.l2(1e-5))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    x = layers.Dropout(0.1)(x)
+    
+    x = layers.Dense(32, kernel_regularizer=keras.regularizers.l2(1e-5))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    
+    # Output layer
+    out = layers.Dense(N_OUT, activation="linear")(x)
+    
+    model = keras.Model(inputs=inp, outputs=out, name="ForwardDynamicsNN")
+    model.compile(
+        optimizer=keras.optimizers.Adam(lr),
+        loss="mse",
+        metrics=["mae", tf.keras.metrics.RootMeanSquaredError(name="rmse")],
+    )
+    return model
+
+
+def train_nn(X, Y, epochs: int = 150, batch_size: int = 64,
+             save_dir: str = "saved_model_2link"):
+    print("=" * 60)
+    print("  Forward Dynamics NN — Training (2-Link Robot - STABLE)")
+    print("=" * 60)
+    
+    X_tr, X_tmp, Y_tr, Y_tmp = train_test_split(
+        X, Y, test_size=0.30, random_state=SEED)
+    X_val, X_te, Y_val, Y_te = train_test_split(
+        X_tmp, Y_tmp, test_size=0.50, random_state=SEED)
+    
+    # Scale features
+    sx = StandardScaler().fit(X_tr)
+    sy = StandardScaler().fit(Y_tr)
+    
+    Xtr_s = sx.transform(X_tr)
+    Ytr_s = sy.transform(Y_tr)
+    Xval_s = sx.transform(X_val)
+    Yval_s = sy.transform(Y_val)
+    
+    print(f"  Train {len(X_tr)} | Val {len(X_val)} | Test {len(X_te)}")
+    
+    model = build_forward_dynamics_nn()
+    model.summary()
+    
+    os.makedirs(save_dir, exist_ok=True)
+    cb = [
+        keras.callbacks.EarlyStopping(
+            monitor="val_loss", patience=20,
+            restore_best_weights=True, verbose=1),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.5, patience=10,
+            min_lr=1e-6, verbose=1),
+        keras.callbacks.ModelCheckpoint(
+            os.path.join(save_dir, "best_model.keras"),
+            monitor="val_loss", save_best_only=True),
+    ]
+    
+    history = model.fit(
+        Xtr_s, Ytr_s,
+        validation_data=(Xval_s, Yval_s),
+        epochs=epochs, batch_size=batch_size,
+        callbacks=cb, verbose=1,
+    )
+    
+    # Test evaluation
+    Xte_s = sx.transform(X_te)
+    Y_pred = sy.inverse_transform(model.predict(Xte_s, verbose=0))
+    print(f"\n  {'Output':<12}  {'MAE':>10}  {'RMSE':>10}")
+    print(f"  {'-'*36}")
+    for i, name in enumerate(OUTPUT_NAMES):
+        mae = np.mean(np.abs(Y_te[:, i] - Y_pred[:, i]))
+        rmse = np.sqrt(np.mean((Y_te[:, i] - Y_pred[:, i]) ** 2))
+        print(f"  {name:<12}  {mae:>10.4f}  {rmse:>10.4f}")
+    
+    plot_training(history, save_dir)
+    return model, history, sx, sy
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4.  PID CONTROLLER (with conservative gains)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PID:
+    """PID controller with anti-windup and output smoothing."""
+    
+    def __init__(self, kp: float, ki: float, kd: float,
+                 dt: float = DT, limit: float = None, alpha: float = 0.9):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.dt = dt
+        self.limit = limit
+        self.alpha = alpha  # Derivative filter coefficient
+        self._i = 0.0
+        self._e = 0.0
+        self._d_filtered = 0.0
+    
+    def reset(self):
+        self._i = 0.0
+        self._e = 0.0
+        self._d_filtered = 0.0
+    
+    def step(self, error: float) -> float:
+        # Proportional term
+        p = self.kp * error
+        
+        # Integral term with anti-windup
+        self._i += error * self.dt
+        i = self.ki * self._i
+        
+        # Derivative term with low-pass filter
+        d_raw = (error - self._e) / self.dt if self.dt > 0 else 0
+        self._d_filtered = self.alpha * self._d_filtered + (1 - self.alpha) * d_raw
+        d = self.kd * self._d_filtered
+        self._e = error
+        
+        out = p + i + d
+        
+        # Apply limit with anti-windup
+        if self.limit is not None:
+            if out > self.limit:
+                out = self.limit
+                if self.ki != 0:
+                    self._i -= error * self.dt  # Anti-windup
+            elif out < -self.limit:
+                out = -self.limit
+                if self.ki != 0:
+                    self._i -= error * self.dt  # Anti-windup
+        
+        return out
+
+
+class TwoLinkRobotPIDController:
+    """
+    Conservative PID controller for stable 2-link robot control.
+    """
+    
+    def __init__(self, dt: float = DT):
+        # Conservative gains for stability
+        TAU_LIM = 20.0  # Reduced torque limit
+        
+        # Position loop (lower gains for stability)
+        self.pid_q1 = PID(kp=20.0, ki=2.0, kd=3.0, dt=dt, limit=TAU_LIM, alpha=0.8)
+        self.pid_q2 = PID(kp=15.0, ki=1.5, kd=2.5, dt=dt, limit=TAU_LIM, alpha=0.8)
+        
+        # Torque loop (very low gains - mainly for compensation)
+        self.pid_tau1 = PID(kp=0.2, ki=0.05, kd=0.02, dt=dt, limit=TAU_LIM, alpha=0.95)
+        self.pid_tau2 = PID(kp=0.2, ki=0.05, kd=0.02, dt=dt, limit=TAU_LIM, alpha=0.95)
+    
+    def reset(self):
+        for pid in (self.pid_q1, self.pid_q2, self.pid_tau1, self.pid_tau2):
+            pid.reset()
+    
+    def compute(self,
+                ref: tuple,  # (q1*, q2*, tau1*, tau2*)
+                q1: float, q2: float,
+                tau1_hat: float, tau2_hat: float) -> np.ndarray:
+        """Compute torque commands with stability limits."""
+        q1_d, q2_d, tau1_d, tau2_d = ref
+        
+        # Error for position control
+        q1_error = q1_d - q1
+        q2_error = q2_d - q2
+        
+        # Error for torque control
+        tau1_error = tau1_d - tau1_hat
+        tau2_error = tau2_d - tau2_hat
+        
+        # Compute torque commands
+        dtau1 = self.pid_q1.step(q1_error) + self.pid_tau1.step(tau1_error)
+        dtau2 = self.pid_q2.step(q2_error) + self.pid_tau2.step(tau2_error)
+        
+        # Apply safe torque limits
+        tau = np.clip(np.array([dtau1, dtau2]), -TAU_MAX, TAU_MAX)
+        return tau
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5.  CLOSED-LOOP SIMULATION (with safety monitoring)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_closed_loop(model: keras.Model,
+                    sx: StandardScaler,
+                    sy: StandardScaler,
+                    ref1: tuple = (0.5, 0.3, 5.0, 3.0),   # Conservative targets
+                    ref2: tuple = (-0.3, 0.6, -4.0, 4.0),
+                    T: float = 6.0,
+                    dt: float = DT,
+                    save_dir: str = "saved_model_2link") -> dict:
+    """Run closed-loop simulation with safety monitoring."""
+    n_steps = int(T / dt)
+    robot = TwoLinkRobotSimulator(dt=dt)
+    pid = TwoLinkRobotPIDController(dt=dt)
+    
+    @tf.function(input_signature=[tf.TensorSpec([1, N_IN], tf.float32)])
+    def nn_infer(x_s):
+        return model(x_s, training=False)
+    
+    log = {k: np.zeros(n_steps) for k in
+           ["t", "q1", "q2", "dq1", "dq2", "tau1", "tau2",
+            "tau1_hat", "tau2_hat", "tau1_cmd", "tau2_cmd",
+            "x", "y"]}
+    
+    tau_cmd = np.zeros(2)
+    stability_violations = 0
+    
+    print(f"\n[Closed-loop] Running {n_steps} steps (T={T}s, dt={dt}s) …")
+    
+    for k in range(n_steps):
+        t = k * dt
+        ref = ref1 if t < T / 2 else ref2
+        
+        # Get robot state
+        q1, q2, dq1, dq2 = robot.q1, robot.q2, robot.dq1, robot.dq2
+        
+        # NN prediction
+        nn_in = np.array([[tau_cmd[0], tau_cmd[1], q1, q2, dq1, dq2]], dtype=np.float32)
+        nn_in_s = sx.transform(nn_in)
+        nn_out = sy.inverse_transform(
+            nn_infer(tf.constant(nn_in_s)).numpy()
+        )[0]
+        
+        # Compute control
+        tau_cmd = pid.compute(ref, q1, q2, nn_out[0], nn_out[1])
+        
+        # Step robot
+        _, (tau1_act, tau2_act, ddq1, ddq2) = robot.step(tau_cmd)
+        
+        # Safety check
+        if abs(ddq1) > DDQ_MAX * 0.9 or abs(ddq2) > DDQ_MAX * 0.9:
+            stability_violations += 1
+            if stability_violations > 10:
+                print(f"  Warning: High accelerations detected at t={t:.2f}s")
+        
+        # Log data
+        log["t"][k] = t
+        log["q1"][k] = q1; log["q2"][k] = q2
+        log["dq1"][k] = dq1; log["dq2"][k] = dq2
+        log["tau1_hat"][k] = nn_out[0]; log["tau2_hat"][k] = nn_out[1]
+        log["tau1"][k] = tau1_act; log["tau2"][k] = tau2_act
+        log["tau1_cmd"][k] = tau_cmd[0]; log["tau2_cmd"][k] = tau_cmd[1]
+        
+        x, y = robot.get_end_effector_position()
+        log["x"][k] = x; log["y"][k] = y
+    
+    print(f"  Simulation complete. Stability violations: {stability_violations}")
+    plot_closed_loop(log, ref1, ref2, T, save_dir)
+    return log
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6.  PLOTTING FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def plot_training(history, save_dir: str):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    fig.suptitle("Forward Dynamics NN — Training Curves (2-Link Robot - STABLE)", fontsize=12)
+    
+    metrics = ["loss", "val_loss"]
+    axes[0].plot(history.history[metrics[0]], label="Train")
+    axes[0].plot(history.history[metrics[1]], label="Validation")
+    axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("MSE Loss")
+    axes[0].set_title("Loss"); axes[0].legend(); axes[0].grid(True)
+    axes[0].set_yscale('log')
+    
+    metrics = ["mae", "val_mae"]
+    axes[1].plot(history.history[metrics[0]], label="Train")
+    axes[1].plot(history.history[metrics[1]], label="Validation")
+    axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("MAE")
+    axes[1].set_title("Mean Absolute Error"); axes[1].legend(); axes[1].grid(True)
+    
+    plt.tight_layout()
+    out = os.path.join(save_dir, "training_curves.png")
+    plt.savefig(out, dpi=150)
+    plt.show()
+    print(f"  Saved → {out}")
+
+
+def plot_closed_loop(log: dict, ref1: tuple, ref2: tuple, T: float, save_dir: str):
+    t = log["t"]
+    t_mid = T / 2.0
+    
+    fig, axes = plt.subplots(3, 2, figsize=(14, 13))
+    fig.suptitle(
+        "Closed-Loop: 2-Link Robot (STABLE VERSION)\n"
+        f"Phase-1 ref = {ref1}   Phase-2 ref = {ref2}", fontsize=11)
+    
+    def _ref_lines(ax, val1, val2, color):
+        ax.axvline(t_mid, color="gray", ls="--", lw=0.8, alpha=0.6)
+        ax.axhline(val1, color=color, ls=":", lw=1.5, alpha=0.7, label="ref phase 1")
+        ax.axhline(val2, color=color, ls="-.", lw=1.5, alpha=0.7, label="ref phase 2")
+    
+    # Joint angles
+    ax = axes[0, 0]
+    _ref_lines(ax, ref1[0], ref2[0], "tab:blue")
+    ax.plot(t, log["q1"], color="tab:blue", lw=1.8, label="q1 actual")
+    ax.set_ylabel("q1 (rad)"); ax.set_title("Joint 1 Position")
+    ax.legend(fontsize=8); ax.grid(True)
+    
+    ax = axes[0, 1]
+    _ref_lines(ax, ref1[1], ref2[1], "tab:orange")
+    ax.plot(t, log["q2"], color="tab:orange", lw=1.8, label="q2 actual")
+    ax.set_ylabel("q2 (rad)"); ax.set_title("Joint 2 Position")
+    ax.legend(fontsize=8); ax.grid(True)
+    
+    # Velocities
+    ax = axes[1, 0]
+    ax.plot(t, log["dq1"], color="tab:green", lw=1.5, label="dq1")
+    ax.plot(t, log["dq2"], color="tab:red", lw=1.5, label="dq2")
+    ax.set_ylabel("Velocity (rad/s)"); ax.set_title("Joint Velocities")
+    ax.legend(fontsize=8); ax.grid(True)
+    
+    # Torques
+    ax = axes[1, 1]
+    ax.plot(t, log["tau1"], color="tab:green", lw=1.5, label="tau1 actual")
+    ax.plot(t, log["tau1_hat"], color="lightgreen", lw=1.0, ls="--", label="tau1̂ NN")
+    ax.plot(t, log["tau2"], color="tab:red", lw=1.5, label="tau2 actual")
+    ax.plot(t, log["tau2_hat"], color="salmon", lw=1.0, ls="--", label="tau2̂ NN")
+    ax.set_ylabel("Torque (Nm)"); ax.set_title("Joint Torques")
+    ax.legend(fontsize=8); ax.grid(True)
+    
+    # Command torques
+    ax = axes[2, 0]
+    ax.plot(t, log["tau1_cmd"], color="tab:blue", lw=1.2, label="tau1 cmd")
+    ax.plot(t, log["tau2_cmd"], color="tab:orange", lw=1.2, label="tau2 cmd")
+    ax.axhline(TAU_MAX, color="k", ls="--", lw=0.8, alpha=0.5)
+    ax.axhline(-TAU_MAX, color="k", ls="--", lw=0.8, alpha=0.5)
+    ax.set_xlabel("Time (s)"); ax.set_ylabel("Torque (Nm)")
+    ax.set_title("Command Torques"); ax.legend(fontsize=8); ax.grid(True)
+    
+    # End-effector trajectory
+    ax = axes[2, 1]
+    ax.plot(log["x"], log["y"], lw=1.8, color="steelblue", label="Path")
+    ax.plot(log["x"][0], log["y"][0], "go", ms=9, label="Start")
+    ax.plot(log["x"][-1], log["y"][-1], "rs", ms=9, label="End")
+    mid = len(t) // 2
+    ax.plot(log["x"][mid], log["y"][mid], "k^", ms=8, label="Switch")
+    ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
+    ax.set_title("End-Effector Trajectory")
+    ax.legend(fontsize=8); ax.grid(True); ax.set_aspect("equal")
+    
+    plt.tight_layout()
+    out = os.path.join(save_dir, "closed_loop_stable_results.png")
+    plt.savefig(out, dpi=150)
+    plt.show()
+    print(f"  Saved → {out}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7.  MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    SAVE_DIR = "saved_model_2link_stable"
+    
+    print("\n" + "="*60)
+    print("  STABLE 2-LINK ROBOT CONTROL SYSTEM")
+    print("="*60)
+    
+    # Generate data
+    print("\n[1/3] Generating training data from simulator (smooth exploration)...")
+    X, Y = generate_training_data(n_samples=20_000, noise_std=0.01)
+    print(f"      X shape: {X.shape}   Y shape: {Y.shape}")
+    print(f"      Data range - q1: [{X[:,2].min():.2f}, {X[:,2].max():.2f}], "
+          f"dq1: [{X[:,4].min():.2f}, {X[:,4].max():.2f}]")
+    
+    # Train NN
+    print("\n[2/3] Training Forward Dynamics NN...")
+    model, history, sx, sy = train_nn(
+        X, Y,
+        epochs=150,
+        batch_size=64,
+        save_dir=SAVE_DIR,
+    )
+    
+    # Run closed-loop simulation with conservative references
+    print("\n[3/3] Running stable closed-loop PID simulation...")
+    log = run_closed_loop(
+        model, sx, sy,
+        ref1=(0.5, 0.3, 5.0, 3.0),    # Conservative first target
+        ref2=(-0.3, 0.6, -4.0, 4.0),  # Conservative second target
+        T=6.0,
+        save_dir=SAVE_DIR,
+    )
+    
+    print("\n✓ Simulation completed successfully!")
