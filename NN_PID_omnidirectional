@@ -1,0 +1,597 @@
+"""
+Omnidirectional Robot — Forward Dynamics NN + PID Controller
+=============================================================
+
+Closed-loop architecture:
+
+  Desired (vx*, vy*, Fx*, Fy*)
+          │
+          ▼
+   [  PID Controller  ]  ←── error from (robot state + NN predictions)
+          │
+          ▼
+    [u1, u2, u3]  ──────────────────────────→ [ Robot Simulator ]
+          │                                            │
+          ▼                                            ▼
+  [ Forward Dynamics NN ]  ←── [w1,w2,w3, vx,vy,ω,θ]
+  predicts (Fx̂, Fŷ, âx, ây, α̂)
+          │
+          └─────────────────── fed back to PID ────────┘
+
+NN Inputs  (10): u1, u2, u3 | w1, w2, w3 | vx, vy | omega | theta
+NN Outputs  (5): Fx, Fy, ax, ay, alpha
+"""
+
+import os
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+# ── Reproducibility ───────────────────────────────────────────────────────────
+SEED = 42
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+# ── Robot physical parameters ─────────────────────────────────────────────────
+MASS         = 5.0          # kg
+INERTIA      = 0.1          # kg·m²
+WHEEL_RADIUS = 0.05         # m
+BASE_RADIUS  = 0.15         # m   distance from robot centre to each wheel
+WHEEL_ANGLES = np.array([90., 210., 330.]) * np.pi / 180.   # rad
+KM           = 0.08         # motor torque constant  (N·m / V)
+KV           = 0.05         # viscous back-EMF / damping  (N·m·s / rad)
+J_WHEEL      = 2e-4         # wheel + rotor inertia  (kg·m²)
+C_DRAG       = 0.3          # body viscous drag  (N·s / m)
+DT           = 0.01         # simulation time-step  (s)
+U_MAX        = 12.0         # motor voltage limit  (V)
+
+# ── Wheel Jacobian ─────────────────────────────────────────────────────────────
+# Row i maps body velocity [vx_b, vy_b, ω] to wheel angular velocity w_i
+#   w_i = (1/r) · [-sin(φ_i)·vx_b  +  cos(φ_i)·vy_b  +  L·ω]
+J_WHL = np.array(
+    [[-np.sin(a), np.cos(a), BASE_RADIUS] for a in WHEEL_ANGLES],
+    dtype=np.float64
+) / WHEEL_RADIUS                       # shape (3, 3)
+
+J_WHL_INV = np.linalg.pinv(J_WHL)     # body ← wheel  (3, 3)
+
+INPUT_NAMES  = ["u1", "u2", "u3", "w1", "w2", "w3", "vx", "vy", "omega", "theta"]
+OUTPUT_NAMES = ["Fx", "Fy", "ax", "ay", "alpha"]
+N_IN, N_OUT  = len(INPUT_NAMES), len(OUTPUT_NAMES)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1.  ROBOT SIMULATOR  ("real robot" plant)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class OmniRobotSimulator:
+    """
+    Euler-integrated dynamics for a symmetric 3-wheel omnidirectional robot.
+
+    State : x, y, theta  (pose)
+            vx, vy, omega (world-frame velocities)
+            w[3]           (wheel angular velocities)
+    Input : u[3]           (motor voltages, clipped to ±U_MAX)
+
+    The simulator returns both the new observation and the true
+    dynamics quantities (Fx, Fy, ax, ay, alpha) used to train the NN.
+    """
+
+    def __init__(self, dt: float = DT):
+        self.dt = dt
+        self.reset()
+
+    def reset(self):
+        self.x     = 0.0
+        self.y     = 0.0
+        self.theta = 0.0
+        self.vx    = 0.0
+        self.vy    = 0.0
+        self.omega = 0.0
+        self.w     = np.zeros(3)
+
+    def step(self, u: np.ndarray):
+        """
+        Advance one timestep.
+
+        Returns
+        -------
+        obs     : np.ndarray (10,)  [vx, vy, omega, theta, w1, w2, w3, x, y, (pad)]
+        dyn     : tuple  (Fx, Fy, ax, ay, alpha)  — ground-truth labels for NN
+        """
+        u   = np.clip(u, -U_MAX, U_MAX)
+        dt  = self.dt
+
+        # ── Motor dynamics: exact solution of J_w·dw/dt = Km·u − Kv·w ──────
+        # Euler integration is unstable when dt > 2·(J_WHEEL/KV).
+        # The exact first-order solution w(t+dt) = w_ss + (w-w_ss)·e^(-dt/τ)
+        # is unconditionally stable for any dt.
+        tau_m   = J_WHEEL / KV                           # motor time constant
+        w_ss    = (KM / KV) * u                          # steady-state wheel vel
+        self.w  = w_ss + (self.w - w_ss) * np.exp(-dt / tau_m)
+
+        # ── Wheel torques → body forces via Jacobian transpose ────────────
+        # Virtual-work duality: F_body = J^T · τ_wheels (torques, not forces).
+        # Using wheel forces F_w = τ/r here would drop a factor of r.
+        tau_w   = KM * u - KV * self.w          # wheel torques  (N·m)
+        F_body  = J_WHL.T @ tau_w               # [Fx_b, Fy_b, Mz_b]
+
+        # ── Body → world frame ────────────────────────────────────────────
+        ct, st  = np.cos(self.theta), np.sin(self.theta)
+        Fx      =  ct * F_body[0] - st * F_body[1]
+        Fy      =  st * F_body[0] + ct * F_body[1]
+
+        # ── Net forces (drag) ─────────────────────────────────────────────
+        Fx_net  = Fx - C_DRAG * self.vx
+        Fy_net  = Fy - C_DRAG * self.vy
+        Mz_net  = F_body[2] - C_DRAG * INERTIA * self.omega
+
+        # ── Accelerations ─────────────────────────────────────────────────
+        ax      = Fx_net / MASS
+        ay      = Fy_net / MASS
+        alpha   = Mz_net / INERTIA
+
+        # ── Integrate & clamp (prevent runaway on large disturbances) ────────
+        self.vx    = np.clip(self.vx    + ax    * dt, -20., 20.)
+        self.vy    = np.clip(self.vy    + ay    * dt, -20., 20.)
+        self.omega = np.clip(self.omega + alpha * dt, -30., 30.)
+        self.x     += self.vx    * dt
+        self.y     += self.vy    * dt
+        self.theta += self.omega * dt
+        self.theta  = (self.theta + np.pi) % (2 * np.pi) - np.pi
+
+        obs = np.array([self.vx, self.vy, self.omega, self.theta,
+                        self.w[0], self.w[1], self.w[2],
+                        self.x, self.y], dtype=np.float32)
+        return obs, (Fx, Fy, ax, ay, alpha)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2.  TRAINING DATA GENERATION  (random exploration of the simulator)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def generate_training_data(n_samples: int = 15_000, noise_std: float = 0.02):
+    """
+    Collect (inputs, outputs) pairs by driving the simulator with random motor
+    voltages that cover the full operating envelope.
+
+    Inputs  rows : [u1, u2, u3, w1, w2, w3, vx, vy, omega, theta]
+    Outputs rows : [Fx, Fy, ax, ay, alpha]
+    """
+    robot   = OmniRobotSimulator()
+    X, Y    = [], []
+    u       = np.zeros(3)
+    WARMUP  = 300
+
+    for i in range(n_samples + WARMUP):
+        # Random walk in voltage space with occasional full resets
+        if i % 250 == 0:
+            robot.reset()
+            u = np.random.uniform(-U_MAX * 0.8, U_MAX * 0.8, 3)
+        else:
+            u += np.random.randn(3) * 0.6
+            u  = np.clip(u, -U_MAX, U_MAX)
+
+        obs, (Fx, Fy, ax, ay, alpha) = robot.step(u)
+        vx, vy, omega, theta = obs[0], obs[1], obs[2], obs[3]
+        w1, w2, w3           = obs[4], obs[5], obs[6]
+
+        if i >= WARMUP:
+            row_x = [u[0], u[1], u[2], w1, w2, w3, vx, vy, omega, theta]
+            row_y = [Fx, Fy, ax, ay, alpha]
+            if np.all(np.isfinite(row_x)) and np.all(np.isfinite(row_y)):
+                X.append(row_x)
+                Y.append(row_y)
+            else:                               # bad sample — reset and skip
+                robot.reset()
+                u = np.zeros(3)
+
+    X = np.array(X, dtype=np.float32)
+    Y = np.array(Y, dtype=np.float32)
+
+    # Additive sensor noise on wheel / velocity measurements
+    X[:, 3:9] += np.random.normal(0, noise_std, (len(X), 6))
+    Y         += np.random.normal(0, noise_std * np.std(Y, axis=0), Y.shape)
+
+    return X, Y
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3.  FORWARD DYNAMICS NN
+#     Input (10)  →  Dense(128)→BN→ReLU→Drop  →  Dense(64)→BN→ReLU→Drop
+#                 →  Dense(5) linear
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_forward_dynamics_nn(lr: float = 1e-3) -> keras.Model:
+    inp = keras.Input(shape=(N_IN,), name="robot_inputs")
+
+    # ── Hidden layer 1 ───────────────────────────────────────────────────────
+    x = layers.Dense(128, use_bias=False, name="dense_1")(inp)
+    x = layers.BatchNormalization(name="bn_1")(x)
+    x = layers.Activation("relu", name="relu_1")(x)
+    x = layers.Dropout(0.2, name="drop_1")(x)
+
+    # ── Hidden layer 2 ───────────────────────────────────────────────────────
+    x = layers.Dense(64, use_bias=False, name="dense_2")(x)
+    x = layers.BatchNormalization(name="bn_2")(x)
+    x = layers.Activation("relu", name="relu_2")(x)
+    x = layers.Dropout(0.2, name="drop_2")(x)
+
+    # ── Output layer (linear — regression) ───────────────────────────────────
+    out = layers.Dense(N_OUT, activation="linear", name="dynamics_out")(x)
+
+    model = keras.Model(inputs=inp, outputs=out, name="ForwardDynamicsNN")
+    model.compile(
+        optimizer=keras.optimizers.Adam(lr),
+        loss="mse",
+        metrics=["mae", tf.keras.metrics.RootMeanSquaredError(name="rmse")],
+    )
+    return model
+
+
+def train_nn(X, Y, epochs: int = 100, batch_size: int = 64,
+             save_dir: str = "saved_model"):
+    print("=" * 60)
+    print("  Forward Dynamics NN — Training")
+    print("=" * 60)
+
+    X_tr, X_tmp, Y_tr, Y_tmp = train_test_split(
+        X, Y, test_size=0.30, random_state=SEED)
+    X_val, X_te, Y_val, Y_te = train_test_split(
+        X_tmp, Y_tmp, test_size=0.50, random_state=SEED)
+
+    sx = StandardScaler().fit(X_tr)
+    sy = StandardScaler().fit(Y_tr)
+
+    Xtr_s  = sx.transform(X_tr);  Ytr_s  = sy.transform(Y_tr)
+    Xval_s = sx.transform(X_val); Yval_s = sy.transform(Y_val)
+    Xte_s  = sx.transform(X_te)
+
+    print(f"  Train {len(X_tr)} | Val {len(X_val)} | Test {len(X_te)}")
+
+    model = build_forward_dynamics_nn()
+    model.summary()
+
+    os.makedirs(save_dir, exist_ok=True)
+    cb = [
+        keras.callbacks.EarlyStopping(
+            monitor="val_loss", patience=15,
+            restore_best_weights=True, verbose=1),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.5, patience=7,
+            min_lr=1e-6, verbose=1),
+        keras.callbacks.ModelCheckpoint(
+            os.path.join(save_dir, "best_model.keras"),
+            monitor="val_loss", save_best_only=True),
+        keras.callbacks.TensorBoard(
+            log_dir=os.path.join(save_dir, "logs"), histogram_freq=1),
+    ]
+
+    history = model.fit(
+        Xtr_s, Ytr_s,
+        validation_data=(Xval_s, Yval_s),
+        epochs=epochs, batch_size=batch_size,
+        callbacks=cb, verbose=1,
+    )
+
+    # ── Test evaluation ───────────────────────────────────────────────────────
+    Y_pred = sy.inverse_transform(model.predict(Xte_s, verbose=0))
+    print(f"\n  {'Output':<8}  {'MAE':>10}  {'RMSE':>10}")
+    print(f"  {'-'*32}")
+    for i, name in enumerate(OUTPUT_NAMES):
+        mae  = np.mean(np.abs(Y_te[:, i] - Y_pred[:, i]))
+        rmse = np.sqrt(np.mean((Y_te[:, i] - Y_pred[:, i]) ** 2))
+        print(f"  {name:<8}  {mae:>10.4f}  {rmse:>10.4f}")
+
+    plot_training(history, save_dir)
+    return model, history, sx, sy
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4.  PID CONTROLLER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PID:
+    """Single-channel PID with integral anti-windup."""
+
+    def __init__(self, kp: float, ki: float, kd: float,
+                 dt: float = DT, limit: float = None):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.dt    = dt
+        self.limit = limit
+        self._i    = 0.0
+        self._e    = 0.0
+
+    def reset(self):
+        self._i = 0.0
+        self._e = 0.0
+
+    def step(self, error: float) -> float:
+        self._i += error * self.dt
+        d        = (error - self._e) / self.dt
+        self._e  = error
+        out      = self.kp * error + self.ki * self._i + self.kd * d
+        if self.limit is not None:
+            out = np.clip(out, -self.limit, self.limit)
+            if abs(out) >= self.limit:          # anti-windup
+                self._i -= error * self.dt
+        return out
+
+
+class OmniRobotPIDController:
+    """
+    Four-channel PID for simultaneous velocity + force control.
+
+    Two independent control objectives are combined:
+
+      (A) Velocity tracking  :  pid_vx / pid_vy drive  vx → vx*,  vy → vy*
+                                 → output is a desired body-frame force
+
+      (B) Force tracking     :  pid_Fx / pid_Fy drive  Fx̂ → Fx*, Fŷ → Fy*
+                                 → output is an additive force correction
+
+    The summed body-frame force command is converted to motor voltages via
+    the wheel Jacobian transpose:  τ_wheel = J^T · F_body ,  u = τ / Km
+    """
+
+    def __init__(self, dt: float = DT):
+        F_LIM = 30.0                                  # N  (clamp PID outputs)
+        # Velocity loop  (higher gains — primary motion objective)
+        self.pid_vx = PID(kp=10.0, ki=2.0, kd=0.8, dt=dt, limit=F_LIM)
+        self.pid_vy = PID(kp=10.0, ki=2.0, kd=0.8, dt=dt, limit=F_LIM)
+        # Force loop  (lower gains — secondary correction)
+        self.pid_Fx = PID(kp=0.6,  ki=0.12, kd=0.06, dt=dt, limit=F_LIM)
+        self.pid_Fy = PID(kp=0.6,  ki=0.12, kd=0.06, dt=dt, limit=F_LIM)
+
+    def reset(self):
+        for pid in (self.pid_vx, self.pid_vy, self.pid_Fx, self.pid_Fy):
+            pid.reset()
+
+    def compute(self,
+                ref:     tuple,           # (vx*, vy*, Fx*, Fy*)
+                vx:      float,
+                vy:      float,
+                Fx_hat:  float,
+                Fy_hat:  float,
+                theta:   float) -> np.ndarray:
+        """
+        Returns motor voltage commands u[3].
+
+        Steps
+        -----
+        1. PID on velocity error  → desired world-frame force Δ F_vel
+        2. PID on force error     → force correction         Δ F_frc
+        3. Sum → F_world_cmd
+        4. Rotate to body frame   → F_body_cmd
+        5. J^T  maps body forces  → wheel torques
+        6. τ / Km                 → motor voltages  (clipped to ±U_MAX)
+        """
+        vx_d, vy_d, Fx_d, Fy_d = ref
+
+        # ── Step 1 & 2 ────────────────────────────────────────────────────────
+        dFx = self.pid_vx.step(vx_d - vx) + self.pid_Fx.step(Fx_d - Fx_hat)
+        dFy = self.pid_vy.step(vy_d - vy) + self.pid_Fy.step(Fy_d - Fy_hat)
+
+        # ── Step 4: world → body frame ────────────────────────────────────────
+        ct, st   = np.cos(theta), np.sin(theta)
+        Fx_b     =  ct * dFx + st * dFy
+        Fy_b     = -st * dFx + ct * dFy
+        F_body   = np.array([Fx_b, Fy_b, 0.0])
+
+        # ── Step 5 & 6 ────────────────────────────────────────────────────────
+        # Invert the duality relation F_body = J^T · τ  →  τ = (J^T)^{-1} · F_body.
+        # Using J^T directly (forward direction) amplifies by ~1/r/Km ≈ 250 V/N,
+        # saturating motors at any non-zero force command.
+        tau = np.linalg.solve(J_WHL.T, F_body)   # wheel torques  (N·m)
+        u   = np.clip(tau / KM, -U_MAX, U_MAX)
+        return u
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5.  CLOSED-LOOP SIMULATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_closed_loop(model: keras.Model,
+                    sx: StandardScaler,
+                    sy: StandardScaler,
+                    ref1: tuple = ( 0.5,  0.3,  2.0,  1.5),   # phase-1 setpoint
+                    ref2: tuple = (-0.4,  0.5, -1.0,  1.0),   # phase-2 setpoint
+                    T: float    = 8.0,
+                    dt: float   = DT,
+                    save_dir: str = "saved_model") -> dict:
+    """
+    Full closed-loop simulation using:
+      • OmniRobotSimulator  as the real plant
+      • ForwardDynamicsNN   as the virtual force/acceleration sensor
+      • OmniRobotPIDController  closing the loop
+
+    Reference switches from ref1 → ref2 at t = T/2.
+    """
+    n_steps  = int(T / dt)
+    robot    = OmniRobotSimulator(dt=dt)
+    pid      = OmniRobotPIDController(dt=dt)
+
+    # Pre-compile NN inference as a TF function for speed
+    @tf.function(input_signature=[tf.TensorSpec([1, N_IN], tf.float32)])
+    def nn_infer(x_s):
+        return model(x_s, training=False)
+
+    log = {k: np.zeros(n_steps) for k in
+           ["t", "vx", "vy", "Fx", "Fy", "Fx_hat", "Fy_hat",
+            "u1", "u2", "u3", "x", "y"]}
+
+    u = np.zeros(3)
+
+    print(f"\n[Closed-loop] Running {n_steps} steps  (T={T}s, dt={dt}s) …")
+    for k in range(n_steps):
+        t     = k * dt
+        ref   = ref1 if t < T / 2 else ref2
+
+        # ── Current state from robot ──────────────────────────────────────
+        obs   = np.array([robot.vx, robot.vy, robot.omega, robot.theta,
+                          robot.w[0], robot.w[1], robot.w[2],
+                          robot.x, robot.y])
+        vx, vy, omega, theta = obs[0], obs[1], obs[2], obs[3]
+        w1, w2, w3           = obs[4], obs[5], obs[6]
+
+        # ── NN prediction  (virtual force sensor) ────────────────────────
+        nn_in   = np.array([[u[0], u[1], u[2],
+                              w1,  w2,  w3,
+                              vx,  vy, omega, theta]], dtype=np.float32)
+        nn_in_s = sx.transform(nn_in)
+        nn_out  = sy.inverse_transform(
+            nn_infer(tf.constant(nn_in_s)).numpy()
+        )[0]                                  # [Fx̂, Fŷ, âx, ây, α̂]
+
+        # ── PID ───────────────────────────────────────────────────────────
+        u = pid.compute(ref, vx, vy, nn_out[0], nn_out[1], theta)
+
+        # ── Step robot ────────────────────────────────────────────────────
+        _, (Fx, Fy, ax, ay, alpha) = robot.step(u)
+
+        # ── Log ───────────────────────────────────────────────────────────
+        log["t"][k]      = t
+        log["vx"][k]     = vx;     log["vy"][k]     = vy
+        log["Fx"][k]     = Fx;     log["Fy"][k]     = Fy
+        log["Fx_hat"][k] = nn_out[0]; log["Fy_hat"][k] = nn_out[1]
+        log["u1"][k]     = u[0];   log["u2"][k]     = u[1];   log["u3"][k] = u[2]
+        log["x"][k]      = robot.x; log["y"][k]     = robot.y
+
+    plot_closed_loop(log, ref1, ref2, T, save_dir)
+    return log
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6.  PLOTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def plot_training(history, save_dir: str):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    fig.suptitle("Forward Dynamics NN — Training Curves", fontsize=12)
+
+    for ax, metric, label in zip(
+            axes,
+            [("loss", "val_loss"), ("mae", "val_mae")],
+            ["MSE Loss", "MAE"]):
+        ax.plot(history.history[metric[0]], label="Train")
+        ax.plot(history.history[metric[1]], label="Val")
+        ax.set_xlabel("Epoch"); ax.set_ylabel(label)
+        ax.set_title(label); ax.legend(); ax.grid(True)
+
+    plt.tight_layout()
+    out = os.path.join(save_dir, "training_curves.png")
+    plt.savefig(out, dpi=150); plt.show()
+    print(f"  Saved → {out}")
+
+
+def plot_closed_loop(log: dict, ref1: tuple, ref2: tuple,
+                     T: float, save_dir: str):
+    t     = log["t"]
+    t_mid = T / 2.0
+
+    fig, axes = plt.subplots(3, 2, figsize=(14, 13))
+    fig.suptitle(
+        "Closed-Loop: Omni Robot  PID + Forward Dynamics NN\n"
+        f"Phase-1 ref = {ref1}   Phase-2 ref = {ref2}", fontsize=11)
+
+    def _ref_lines(ax, val1, val2, color):
+        ax.axvline(t_mid, color="gray", ls="--", lw=0.8, alpha=0.6)
+        ax.axhline(val1, color=color, ls=":",  lw=1.5, label=f"ref phase 1")
+        ax.axhline(val2, color=color, ls="-.", lw=1.5, label=f"ref phase 2")
+
+    # ── vx ───────────────────────────────────────────────────────────────────
+    ax = axes[0, 0]
+    _ref_lines(ax, ref1[0], ref2[0], "tab:blue")
+    ax.plot(t, log["vx"], color="tab:blue", lw=1.8, label="vx actual")
+    ax.set_ylabel("vx (m/s)"); ax.set_title("Velocity vx Tracking")
+    ax.legend(fontsize=8); ax.grid(True)
+
+    # ── vy ───────────────────────────────────────────────────────────────────
+    ax = axes[0, 1]
+    _ref_lines(ax, ref1[1], ref2[1], "tab:orange")
+    ax.plot(t, log["vy"], color="tab:orange", lw=1.8, label="vy actual")
+    ax.set_ylabel("vy (m/s)"); ax.set_title("Velocity vy Tracking")
+    ax.legend(fontsize=8); ax.grid(True)
+
+    # ── Fx ───────────────────────────────────────────────────────────────────
+    ax = axes[1, 0]
+    _ref_lines(ax, ref1[2], ref2[2], "tab:green")
+    ax.plot(t, log["Fx"],     color="tab:green", lw=1.8,  label="Fx actual")
+    ax.plot(t, log["Fx_hat"], color="lime",      lw=1.0,
+            ls="--", label="Fx̂ (NN prediction)")
+    ax.set_ylabel("Fx (N)"); ax.set_title("Force Fx Tracking")
+    ax.legend(fontsize=8); ax.grid(True)
+
+    # ── Fy ───────────────────────────────────────────────────────────────────
+    ax = axes[1, 1]
+    _ref_lines(ax, ref1[3], ref2[3], "tab:red")
+    ax.plot(t, log["Fy"],     color="tab:red",  lw=1.8,  label="Fy actual")
+    ax.plot(t, log["Fy_hat"], color="salmon",   lw=1.0,
+            ls="--", label="Fŷ (NN prediction)")
+    ax.set_ylabel("Fy (N)"); ax.set_title("Force Fy Tracking")
+    ax.legend(fontsize=8); ax.grid(True)
+
+    # ── Motor voltages ────────────────────────────────────────────────────────
+    ax = axes[2, 0]
+    for i, (key, color) in enumerate(
+            zip(["u1","u2","u3"], ["tab:blue","tab:orange","tab:green"])):
+        ax.plot(t, log[key], color=color, lw=1.2, label=f"u{i+1}")
+    ax.axhline( U_MAX, color="k", ls="--", lw=0.8, label="±V_max")
+    ax.axhline(-U_MAX, color="k", ls="--", lw=0.8)
+    ax.set_xlabel("Time (s)"); ax.set_ylabel("Voltage (V)")
+    ax.set_title("Motor Voltage Commands")
+    ax.legend(fontsize=8); ax.grid(True)
+
+    # ── XY trajectory ─────────────────────────────────────────────────────────
+    ax = axes[2, 1]
+    ax.plot(log["x"], log["y"], lw=1.8, color="steelblue", label="Trajectory")
+    ax.plot(log["x"][0], log["y"][0], "go", ms=9, label="Start")
+    ax.plot(log["x"][-1], log["y"][-1], "rs", ms=9, label="End")
+    mid = len(t) // 2
+    ax.plot(log["x"][mid], log["y"][mid], "k^", ms=8, label="Phase switch")
+    ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
+    ax.set_title("Robot Trajectory (world frame)")
+    ax.legend(fontsize=8); ax.grid(True); ax.set_aspect("equal")
+
+    plt.tight_layout()
+    out = os.path.join(save_dir, "closed_loop_results.png")
+    plt.savefig(out, dpi=150); plt.show()
+    print(f"  Saved → {out}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7.  MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    SAVE_DIR = "saved_model"
+
+    # ── Phase 1: generate data from simulator ─────────────────────────────────
+    print("[1/3] Generating training data from simulator …")
+    X, Y = generate_training_data(n_samples=15_000)
+    print(f"      X shape: {X.shape}   Y shape: {Y.shape}")
+
+    # ── Phase 2: train the forward dynamics NN ────────────────────────────────
+    print("\n[2/3] Training Forward Dynamics NN …")
+    model, history, sx, sy = train_nn(
+        X, Y,
+        epochs=100,
+        batch_size=64,
+        save_dir=SAVE_DIR,
+    )
+
+    # ── Phase 3: closed-loop PID simulation ───────────────────────────────────
+    print("\n[3/3] Running closed-loop PID simulation …")
+    log = run_closed_loop(
+        model, sx, sy,
+        ref1=( 0.5,  0.3,  2.0,  1.5),   # desired (vx*, vy*, Fx*, Fy*) phase 1
+        ref2=(-0.4,  0.5, -1.0,  1.0),   # phase 2 (reference step)
+        T=8.0,
+        save_dir=SAVE_DIR,
+    )
+
+    print("\nDone.")
